@@ -103,11 +103,12 @@
     <button id="startButton" class="primary">Запустить камеру</button>
     <button id="stopButton" class="secondary" style="display:none;">Остановить камеру</button>
 
+    <div id="result">Нажмите «Запустить камеру».</div>
+    
     <video id="video" playsinline muted autoplay></video>
     <canvas id="canvas"></canvas>
 
-    <div id="result">Нажмите «Запустить камеру».</div>
-
+    
     <div class="manual">
       <details>
         <summary>Ручной ввод token, если камера не работает</summary>
@@ -139,7 +140,9 @@
     let rafId = null;
 
     function setResult(html) {
-      document.getElementById('result').innerHTML = html;
+      const result = document.getElementById('result');
+      result.innerHTML = html;
+      result.scrollIntoView({ behavior: 'smooth', block: 'start' });
     }
 
     function extractToken(text) {
