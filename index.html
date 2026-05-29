@@ -4,20 +4,43 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>Flocktory Check-in</title>
+
   <script src="https://cdn.jsdelivr.net/npm/jsqr@1.4.0/dist/jsQR.min.js"></script>
+
   <style>
+    :root {
+      --bg: #ffffff;
+      --text: #111111;
+      --muted: #777777;
+      --card: #f3f3f3;
+      --black: #111111;
+      --success: #0a7a2f;
+      --warning: #9a6a00;
+      --error: #9b1c1c;
+      --border: #dddddd;
+    }
+
+    * {
+      box-sizing: border-box;
+    }
+
     body {
       font-family: Arial, sans-serif;
       padding: 16px;
       max-width: 520px;
       margin: 0 auto;
       line-height: 1.45;
-      color: #111;
+      color: var(--text);
+      background: var(--bg);
     }
 
     h1 {
       font-size: 30px;
       margin: 20px 0 12px;
+    }
+
+    p {
+      margin: 8px 0;
     }
 
     button {
@@ -27,16 +50,22 @@
       border-radius: 10px;
       border: 0;
       margin: 8px 0;
+      cursor: pointer;
+    }
+
+    button:disabled {
+      opacity: 0.65;
+      cursor: not-allowed;
     }
 
     .primary {
-      background: #111;
+      background: var(--black);
       color: #fff;
     }
 
     .secondary {
       background: #fff;
-      color: #111;
+      color: var(--black);
       border: 1px solid #aaa;
     }
 
@@ -52,11 +81,11 @@
       display: none;
     }
 
-    #result {
+    #statusPanel {
       margin: 12px 0;
       padding: 14px;
       border-radius: 10px;
-      background: #f3f3f3;
+      background: var(--card);
       min-height: 44px;
       font-size: 17px;
       position: sticky;
@@ -65,16 +94,31 @@
       box-shadow: 0 2px 10px rgba(0,0,0,0.08);
     }
 
+    #statusPanel.success {
+      background: #e8f7ed;
+      border: 1px solid #b7e3c3;
+    }
+
+    #statusPanel.warning {
+      background: #fff6df;
+      border: 1px solid #efd28b;
+    }
+
+    #statusPanel.error {
+      background: #fdecec;
+      border: 1px solid #efb6b6;
+    }
+
     .hint {
       margin-top: 16px;
-      color: #777;
+      color: var(--muted);
       font-size: 13px;
     }
 
     .manual {
       margin-top: 20px;
       padding-top: 16px;
-      border-top: 1px solid #ddd;
+      border-top: 1px solid var(--border);
     }
 
     input {
@@ -86,29 +130,90 @@
       border: 1px solid #aaa;
       margin-top: 8px;
     }
+
+    details summary {
+      cursor: pointer;
+      font-size: 15px;
+    }
+
+    .access-error {
+      margin-top: 16px;
+      padding: 14px;
+      border-radius: 10px;
+      background: #fdecec;
+      border: 1px solid #efb6b6;
+      font-size: 17px;
+    }
+
+    .toast {
+      position: fixed;
+      top: 12px;
+      left: 12px;
+      right: 12px;
+      z-index: 9999;
+      padding: 16px;
+      border-radius: 14px;
+      font-size: 20px;
+      font-weight: 700;
+      line-height: 1.35;
+      background: var(--black);
+      color: #fff;
+      box-shadow: 0 6px 24px rgba(0,0,0,0.25);
+    }
+
+    .toast.success {
+      background: var(--success);
+    }
+
+    .toast.warning {
+      background: var(--warning);
+    }
+
+    .toast.error {
+      background: var(--error);
+    }
+
+    .toast.info {
+      background: var(--black);
+    }
+
+    .hidden {
+      display: none;
+    }
+
+    .small {
+      color: var(--muted);
+      font-size: 13px;
+    }
+
+    .version {
+      margin-top: 16px;
+      color: #aaa;
+      font-size: 12px;
+      text-align: center;
+    }
   </style>
 </head>
 
 <body>
+  <div id="toast" class="toast hidden"></div>
+
   <h1>Flocktory Check-in</h1>
   <p>Нажмите кнопку и наведите камеру на QR гостя.</p>
 
-  <div id="accessError" style="display:none;">
-    <div id="result">
-      ⛔ Нет доступа к сканеру. Откройте служебную ссылку с корректным ключом.
-    </div>
+  <div id="accessError" class="access-error" style="display:none;">
+    ⛔ Нет доступа к сканеру. Откройте служебную ссылку с корректным ключом.
   </div>
 
   <div id="scannerUi">
     <button id="startButton" class="primary">Запустить камеру</button>
     <button id="stopButton" class="secondary" style="display:none;">Остановить камеру</button>
 
-    <div id="result">Нажмите «Запустить камеру».</div>
-    
+    <div id="statusPanel">Нажмите «Запустить камеру».</div>
+
     <video id="video" playsinline muted autoplay></video>
     <canvas id="canvas"></canvas>
 
-    
     <div class="manual">
       <details>
         <summary>Ручной ввод token, если камера не работает</summary>
@@ -119,6 +224,10 @@
 
     <div class="hint">
       Если камера не запускается: откройте ссылку в Safari/Chrome, проверьте доступ браузера к камере и обновите страницу.
+    </div>
+
+    <div class="version">
+      scanner v4
     </div>
   </div>
 
@@ -138,20 +247,51 @@
     let lastToken = '';
     let lastScanAt = 0;
     let rafId = null;
+    let toastTimer = null;
 
-    function setResult(html) {
-      const result = document.getElementById('result');
-      result.innerHTML = html;
-      result.scrollIntoView({ behavior: 'smooth', block: 'start' });
+    function showToast(html, type = 'info', timeout = 3500) {
+      const toast = document.getElementById('toast');
+      toast.className = 'toast ' + type;
+      toast.innerHTML = html;
+      toast.classList.remove('hidden');
+
+      clearTimeout(toastTimer);
+      toastTimer = setTimeout(() => {
+        toast.classList.add('hidden');
+      }, timeout);
+    }
+
+    function setStatus(html, type = '') {
+      const panel = document.getElementById('statusPanel');
+      panel.className = type ? type : '';
+      panel.id = 'statusPanel';
+      panel.innerHTML = html;
+      panel.scrollIntoView({ behavior: 'smooth', block: 'start' });
     }
 
     function extractToken(text) {
       const value = String(text || '').trim();
 
+      if (!value) {
+        return '';
+      }
+
       try {
         const url = new URL(value);
-        return url.searchParams.get('token') || value;
+        const tokenFromUrl = url.searchParams.get('token');
+
+        if (tokenFromUrl) {
+          return tokenFromUrl.trim();
+        }
+
+        return value;
       } catch (e) {
+        const match = value.match(/[?&]token=([^&]+)/);
+
+        if (match && match[1]) {
+          return decodeURIComponent(match[1]).trim();
+        }
+
         return value;
       }
     }
@@ -163,17 +303,54 @@
       }
     }
 
+    function detectResultType(html) {
+      const text = String(html || '');
+
+      if (text.includes('✅')) {
+        return 'success';
+      }
+
+      if (text.includes('⚠️')) {
+        return 'warning';
+      }
+
+      if (text.includes('❌') || text.includes('⛔')) {
+        return 'error';
+      }
+
+      return 'success';
+    }
+
+    function shortResultTitle(type) {
+      if (type === 'success') {
+        return '✅ Гость отмечен';
+      }
+
+      if (type === 'warning') {
+        return '⚠️ Гость уже отмечен';
+      }
+
+      if (type === 'error') {
+        return '❌ Ошибка / QR не найден';
+      }
+
+      return 'Готово';
+    }
+
     async function processToken(rawText) {
       const token = extractToken(rawText);
 
       if (!token) {
-        setResult('❌ Не удалось прочитать token.');
+        showToast('❌ Не удалось прочитать QR', 'error');
+        setStatus('❌ Не удалось прочитать token.', 'error');
         return;
       }
 
       const now = Date.now();
 
-      if (busy) return;
+      if (busy) {
+        return;
+      }
 
       if (token === lastToken && now - lastScanAt < 5000) {
         return;
@@ -183,7 +360,8 @@
       lastToken = token;
       lastScanAt = now;
 
-      setResult('Проверяем гостя...');
+      showToast('QR считан<br>Проверяем гостя...', 'info', 2000);
+      setStatus('QR считан. Проверяем гостя...', '');
 
       try {
         const url =
@@ -191,32 +369,45 @@
           '?key=' + encodeURIComponent(secret) +
           '&token=' + encodeURIComponent(token);
 
-        const res = await fetch(url);
-        const html = await res.text();
+        const res = await fetch(url, {
+          method: 'GET',
+          cache: 'no-store'
+        });
 
-        setResult(
+        const html = await res.text();
+        const resultType = detectResultType(html);
+
+        showToast(shortResultTitle(resultType), resultType, 3500);
+
+        setStatus(
           html +
-          '<p style="color:#777;font-size:14px;margin-top:12px;">Можно сканировать следующего гостя.</p>'
+          '<p class="small" style="margin-top:12px;">Можно сканировать следующего гостя.</p>',
+          resultType
         );
 
         if (navigator.vibrate) {
-          navigator.vibrate(120);
+          navigator.vibrate([120, 80, 120]);
         }
       } catch (e) {
-        setResult(
+        showToast('❌ Ошибка check-in', 'error', 4500);
+
+        setStatus(
           '❌ Ошибка check-in. Попробуйте ещё раз.<br><br>' +
           String(e) +
-          '<br><br>Если ошибка похожа на CORS, проверьте headers в n8n Respond to Webhook.'
+          '<br><br><span class="small">Если гость появился в таблице, значит n8n отработал, но браузер не смог прочитать ответ. Проверьте CORS headers в n8n Respond to Webhook.</span>',
+          'error'
         );
       }
 
       setTimeout(function () {
         busy = false;
-      }, 1800);
+      }, 2500);
     }
 
     function scanFrame() {
-      if (!scanning) return;
+      if (!scanning) {
+        return;
+      }
 
       if (video.readyState === video.HAVE_ENOUGH_DATA) {
         const width = video.videoWidth;
@@ -274,25 +465,29 @@
     }
 
     async function startScanner() {
-      if (scanning) return;
+      if (scanning) {
+        return;
+      }
 
       if (!secret) {
-        setResult('⛔ Нет ключа доступа к сканеру.');
+        setStatus('⛔ Нет ключа доступа к сканеру.', 'error');
         return;
       }
 
       if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
-        setResult(
+        setStatus(
           '❌ Этот браузер не даёт доступ к камере.<br><br>' +
-          'Откройте ссылку в Safari/Chrome.'
+          'Откройте ссылку в Safari/Chrome.',
+          'error'
         );
         return;
       }
 
       if (!window.jsQR) {
-        setResult(
+        setStatus(
           '❌ Не загрузилась библиотека сканера.<br><br>' +
-          'Проверьте интернет и обновите страницу.'
+          'Проверьте интернет и обновите страницу.',
+          'error'
         );
         return;
       }
@@ -300,7 +495,7 @@
       document.getElementById('startButton').disabled = true;
       document.getElementById('startButton').innerText = 'Запускаем камеру...';
 
-      setResult('Запрашиваем доступ к камере...');
+      setStatus('Запрашиваем доступ к камере...');
 
       try {
         stream = await getCameraStream();
@@ -315,27 +510,29 @@
         document.getElementById('startButton').style.display = 'none';
         document.getElementById('stopButton').style.display = 'block';
 
-        setResult('✅ Сканер запущен. Наведите камеру на QR гостя.');
+        setStatus('✅ Сканер запущен. Наведите камеру на QR гостя.', 'success');
 
         scanFrame();
       } catch (e) {
         document.getElementById('startButton').disabled = false;
         document.getElementById('startButton').innerText = 'Запустить камеру';
 
-        setResult(
+        setStatus(
           '❌ Не удалось запустить камеру.<br><br>' +
           'Что попробовать:<br>' +
           '1. Открыть ссылку в Safari/Chrome.<br>' +
           '2. Проверить разрешение камеры для браузера.<br>' +
           '3. Закрыть другие приложения, которые могут использовать камеру.<br>' +
           '4. Обновить страницу и нажать кнопку ещё раз.<br><br>' +
-          String(e)
+          String(e),
+          'error'
         );
       }
     }
 
     async function stopScanner() {
       scanning = false;
+      busy = false;
 
       if (rafId) {
         cancelAnimationFrame(rafId);
@@ -357,7 +554,7 @@
       document.getElementById('startButton').innerText = 'Запустить камеру';
       document.getElementById('stopButton').style.display = 'none';
 
-      setResult('Камера остановлена.');
+      setStatus('Камера остановлена.');
     }
 
     document.getElementById('startButton').addEventListener('click', startScanner);
