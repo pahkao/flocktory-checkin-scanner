@@ -1,0 +1,366 @@
+<!doctype html>
+<html lang="ru">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Flocktory Check-in</title>
+  <script src="https://cdn.jsdelivr.net/npm/jsqr@1.4.0/dist/jsQR.min.js"></script>
+  <style>
+    body {
+      font-family: Arial, sans-serif;
+      padding: 16px;
+      max-width: 520px;
+      margin: 0 auto;
+      line-height: 1.45;
+      color: #111;
+    }
+
+    h1 {
+      font-size: 30px;
+      margin: 20px 0 12px;
+    }
+
+    button {
+      width: 100%;
+      padding: 14px;
+      font-size: 18px;
+      border-radius: 10px;
+      border: 0;
+      margin: 8px 0;
+    }
+
+    .primary {
+      background: #111;
+      color: #fff;
+    }
+
+    .secondary {
+      background: #fff;
+      color: #111;
+      border: 1px solid #aaa;
+    }
+
+    #video {
+      display: none;
+      width: 100%;
+      border-radius: 12px;
+      background: #000;
+      margin-top: 12px;
+    }
+
+    #canvas {
+      display: none;
+    }
+
+    #result {
+      margin-top: 16px;
+      padding: 12px;
+      border-radius: 8px;
+      background: #f3f3f3;
+      min-height: 40px;
+    }
+
+    .hint {
+      margin-top: 16px;
+      color: #777;
+      font-size: 13px;
+    }
+
+    .manual {
+      margin-top: 20px;
+      padding-top: 16px;
+      border-top: 1px solid #ddd;
+    }
+
+    input {
+      width: 100%;
+      box-sizing: border-box;
+      padding: 12px;
+      font-size: 16px;
+      border-radius: 8px;
+      border: 1px solid #aaa;
+      margin-top: 8px;
+    }
+  </style>
+</head>
+
+<body>
+  <h1>Flocktory Check-in</h1>
+  <p>Нажмите кнопку и наведите камеру на QR гостя.</p>
+
+  <div id="accessError" style="display:none;">
+    <div id="result">
+      ⛔ Нет доступа к сканеру. Откройте служебную ссылку с корректным ключом.
+    </div>
+  </div>
+
+  <div id="scannerUi">
+    <button id="startButton" class="primary">Запустить камеру</button>
+    <button id="stopButton" class="secondary" style="display:none;">Остановить камеру</button>
+
+    <video id="video" playsinline muted autoplay></video>
+    <canvas id="canvas"></canvas>
+
+    <div id="result">Нажмите «Запустить камеру».</div>
+
+    <div class="manual">
+      <details>
+        <summary>Ручной ввод token, если камера не работает</summary>
+        <input id="manualToken" placeholder="Вставьте token или ссылку из QR">
+        <button id="manualButton" class="secondary">Отметить вручную</button>
+      </details>
+    </div>
+
+    <div class="hint">
+      Если камера не запускается: откройте ссылку в Safari/Chrome, проверьте доступ браузера к камере и обновите страницу.
+    </div>
+  </div>
+
+  <script>
+    const confirmUrl = 'https://fleventbot.app.n8n.cloud/webhook/checkin-confirm';
+
+    const params = new URLSearchParams(window.location.search);
+    const secret = params.get('key') || '';
+
+    const video = document.getElementById('video');
+    const canvas = document.getElementById('canvas');
+    const ctx = canvas.getContext('2d', { willReadFrequently: true });
+
+    let stream = null;
+    let scanning = false;
+    let busy = false;
+    let lastToken = '';
+    let lastScanAt = 0;
+    let rafId = null;
+
+    function setResult(html) {
+      document.getElementById('result').innerHTML = html;
+    }
+
+    function extractToken(text) {
+      const value = String(text || '').trim();
+
+      try {
+        const url = new URL(value);
+        return url.searchParams.get('token') || value;
+      } catch (e) {
+        return value;
+      }
+    }
+
+    function initAccess() {
+      if (!secret) {
+        document.getElementById('scannerUi').style.display = 'none';
+        document.getElementById('accessError').style.display = 'block';
+      }
+    }
+
+    async function processToken(rawText) {
+      const token = extractToken(rawText);
+
+      if (!token) {
+        setResult('❌ Не удалось прочитать token.');
+        return;
+      }
+
+      const now = Date.now();
+
+      if (busy) return;
+
+      if (token === lastToken && now - lastScanAt < 5000) {
+        return;
+      }
+
+      busy = true;
+      lastToken = token;
+      lastScanAt = now;
+
+      setResult('Проверяем гостя...');
+
+      try {
+        const url =
+          confirmUrl +
+          '?key=' + encodeURIComponent(secret) +
+          '&token=' + encodeURIComponent(token);
+
+        const res = await fetch(url);
+        const html = await res.text();
+
+        setResult(
+          html +
+          '<p style="color:#777;font-size:14px;margin-top:12px;">Можно сканировать следующего гостя.</p>'
+        );
+
+        if (navigator.vibrate) {
+          navigator.vibrate(120);
+        }
+      } catch (e) {
+        setResult(
+          '❌ Ошибка check-in. Попробуйте ещё раз.<br><br>' +
+          String(e) +
+          '<br><br>Если ошибка похожа на CORS, проверьте headers в n8n Respond to Webhook.'
+        );
+      }
+
+      setTimeout(function () {
+        busy = false;
+      }, 1800);
+    }
+
+    function scanFrame() {
+      if (!scanning) return;
+
+      if (video.readyState === video.HAVE_ENOUGH_DATA) {
+        const width = video.videoWidth;
+        const height = video.videoHeight;
+
+        if (width && height) {
+          canvas.width = width;
+          canvas.height = height;
+
+          ctx.drawImage(video, 0, 0, width, height);
+
+          const imageData = ctx.getImageData(0, 0, width, height);
+
+          const code = jsQR(
+            imageData.data,
+            imageData.width,
+            imageData.height,
+            {
+              inversionAttempts: 'dontInvert'
+            }
+          );
+
+          if (code && code.data) {
+            processToken(code.data);
+          }
+        }
+      }
+
+      rafId = requestAnimationFrame(scanFrame);
+    }
+
+    async function getCameraStream() {
+      try {
+        return await navigator.mediaDevices.getUserMedia({
+          audio: false,
+          video: {
+            facingMode: { ideal: 'environment' },
+            width: { ideal: 1280 },
+            height: { ideal: 720 }
+          }
+        });
+      } catch (firstError) {
+        try {
+          return await navigator.mediaDevices.getUserMedia({
+            audio: false,
+            video: true
+          });
+        } catch (secondError) {
+          throw new Error(
+            'Ошибка 1: ' + String(firstError) +
+            ' | Ошибка 2: ' + String(secondError)
+          );
+        }
+      }
+    }
+
+    async function startScanner() {
+      if (scanning) return;
+
+      if (!secret) {
+        setResult('⛔ Нет ключа доступа к сканеру.');
+        return;
+      }
+
+      if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
+        setResult(
+          '❌ Этот браузер не даёт доступ к камере.<br><br>' +
+          'Откройте ссылку в Safari/Chrome.'
+        );
+        return;
+      }
+
+      if (!window.jsQR) {
+        setResult(
+          '❌ Не загрузилась библиотека сканера.<br><br>' +
+          'Проверьте интернет и обновите страницу.'
+        );
+        return;
+      }
+
+      document.getElementById('startButton').disabled = true;
+      document.getElementById('startButton').innerText = 'Запускаем камеру...';
+
+      setResult('Запрашиваем доступ к камере...');
+
+      try {
+        stream = await getCameraStream();
+
+        video.srcObject = stream;
+        video.style.display = 'block';
+
+        await video.play();
+
+        scanning = true;
+
+        document.getElementById('startButton').style.display = 'none';
+        document.getElementById('stopButton').style.display = 'block';
+
+        setResult('✅ Сканер запущен. Наведите камеру на QR гостя.');
+
+        scanFrame();
+      } catch (e) {
+        document.getElementById('startButton').disabled = false;
+        document.getElementById('startButton').innerText = 'Запустить камеру';
+
+        setResult(
+          '❌ Не удалось запустить камеру.<br><br>' +
+          'Что попробовать:<br>' +
+          '1. Открыть ссылку в Safari/Chrome.<br>' +
+          '2. Проверить разрешение камеры для браузера.<br>' +
+          '3. Закрыть другие приложения, которые могут использовать камеру.<br>' +
+          '4. Обновить страницу и нажать кнопку ещё раз.<br><br>' +
+          String(e)
+        );
+      }
+    }
+
+    async function stopScanner() {
+      scanning = false;
+
+      if (rafId) {
+        cancelAnimationFrame(rafId);
+        rafId = null;
+      }
+
+      if (stream) {
+        stream.getTracks().forEach(function (track) {
+          track.stop();
+        });
+        stream = null;
+      }
+
+      video.srcObject = null;
+      video.style.display = 'none';
+
+      document.getElementById('startButton').style.display = 'block';
+      document.getElementById('startButton').disabled = false;
+      document.getElementById('startButton').innerText = 'Запустить камеру';
+      document.getElementById('stopButton').style.display = 'none';
+
+      setResult('Камера остановлена.');
+    }
+
+    document.getElementById('startButton').addEventListener('click', startScanner);
+    document.getElementById('stopButton').addEventListener('click', stopScanner);
+
+    document.getElementById('manualButton').addEventListener('click', function () {
+      const value = document.getElementById('manualToken').value;
+      processToken(value);
+    });
+
+    initAccess();
+  </script>
+</body>
+</html>
