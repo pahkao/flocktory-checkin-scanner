@@ -192,6 +192,12 @@
       font-size: 12px;
       text-align: center;
     }
+
+    #syncStatus {
+      margin-top: 10px;
+      color: var(--muted);
+      font-size: 13px;
+    }
   </style>
 </head>
 
@@ -208,8 +214,10 @@
   <div id="scannerUi">
     <button id="startButton" class="primary">Запустить камеру</button>
     <button id="stopButton" class="secondary" style="display:none;">Остановить камеру</button>
+    <button id="refreshButton" class="secondary">Обновить список гостей</button>
 
-    <div id="statusPanel">Нажмите «Запустить камеру».</div>
+    <div id="statusPanel">Загружаем список гостей...</div>
+    <div id="syncStatus">Синхронизация: —</div>
 
     <video id="video" playsinline muted autoplay></video>
     <canvas id="canvas"></canvas>
@@ -227,12 +235,13 @@
     </div>
 
     <div class="version">
-      scanner v6
+      scanner v7-local-manifest
     </div>
   </div>
 
   <script>
     const confirmUrl = 'https://fleventbot.app.n8n.cloud/webhook/checkin-confirm';
+    const manifestUrl = 'https://fleventbot.app.n8n.cloud/webhook/checkin-manifest';
 
     const params = new URLSearchParams(window.location.search);
     const secret = params.get('key') || '';
@@ -241,6 +250,11 @@
     const canvas = document.getElementById('canvas');
     const ctx = canvas.getContext('2d', { willReadFrequently: true });
 
+    const storagePrefix = 'flocktory_checkin_v7_';
+    const manifestStorageKey = storagePrefix + 'manifest';
+    const pendingStorageKey = storagePrefix + 'pending';
+    const localCheckedStorageKey = storagePrefix + 'local_checked';
+
     let stream = null;
     let scanning = false;
     let busy = false;
@@ -248,6 +262,11 @@
     let lastScanAt = 0;
     let rafId = null;
     let toastTimer = null;
+
+    let guestsByToken = new Map();
+    let localCheckedTokens = new Set();
+    let pendingQueue = [];
+    let syncInProgress = false;
 
     function showToast(html, type = 'info', timeout = 3500) {
       const toast = document.getElementById('toast');
@@ -267,6 +286,23 @@
       panel.id = 'statusPanel';
       panel.innerHTML = html;
       panel.scrollIntoView({ behavior: 'smooth', block: 'start' });
+    }
+
+    function setSyncStatus() {
+      const syncedLocal = localCheckedTokens.size;
+      const pending = pendingQueue.length;
+
+      document.getElementById('syncStatus').innerHTML =
+        'Синхронизация: локально отмечено — ' + syncedLocal +
+        ', в очереди на отправку — ' + pending +
+        ', гостей в списке — ' + guestsByToken.size;
+    }
+
+    function escapeHtml(value) {
+      return String(value ?? '')
+        .replace(/&/g, '&amp;')
+        .replace(/</g, '&lt;')
+        .replace(/>/g, '&gt;');
     }
 
     function extractToken(text) {
@@ -303,45 +339,11 @@
       }
     }
 
-    function detectResultType(html) {
-      const text = String(html || '');
-
-      if (text.includes('✅')) {
-        return 'success';
-      }
-
-      if (text.includes('⚠️')) {
-        return 'warning';
-      }
-
-      if (text.includes('❌') || text.includes('⛔')) {
-        return 'error';
-      }
-
-      return 'success';
-    }
-
-    function shortResultTitle(type) {
-      if (type === 'success') {
-        return '✅ Гость отмечен';
-      }
-
-      if (type === 'warning') {
-        return '⚠️ Гость уже отмечен';
-      }
-
-      if (type === 'error') {
-        return '❌ Ошибка / QR не найден';
-      }
-
-      return 'Готово';
-    }
-
     function sleep(ms) {
       return new Promise(resolve => setTimeout(resolve, ms));
     }
 
-    async function fetchWithTimeout(url, timeoutMs = 6000) {
+    async function fetchWithTimeout(url, timeoutMs = 5000) {
       const controller = new AbortController();
       const timer = setTimeout(() => controller.abort(), timeoutMs);
 
@@ -358,30 +360,214 @@
       }
     }
 
-    async function fetchWithRetry(url, attempts = 3, timeoutMs = 6000) {
-      let lastError;
+    function saveLocalState() {
+      localStorage.setItem(pendingStorageKey, JSON.stringify(pendingQueue));
+      localStorage.setItem(localCheckedStorageKey, JSON.stringify(Array.from(localCheckedTokens)));
+      setSyncStatus();
+    }
 
-      for (let attempt = 1; attempt <= attempts; attempt++) {
-        try {
-          if (attempt > 1) {
+    function loadLocalState() {
+      try {
+        const pendingRaw = localStorage.getItem(pendingStorageKey);
+        const checkedRaw = localStorage.getItem(localCheckedStorageKey);
+
+        pendingQueue = pendingRaw ? JSON.parse(pendingRaw) : [];
+        localCheckedTokens = new Set(checkedRaw ? JSON.parse(checkedRaw) : []);
+      } catch (e) {
+        pendingQueue = [];
+        localCheckedTokens = new Set();
+      }
+
+      setSyncStatus();
+    }
+
+    function saveManifest(manifest) {
+      localStorage.setItem(manifestStorageKey, JSON.stringify(manifest));
+    }
+
+    function readCachedManifest() {
+      try {
+        const raw = localStorage.getItem(manifestStorageKey);
+        return raw ? JSON.parse(raw) : null;
+      } catch (e) {
+        return null;
+      }
+    }
+
+    function applyManifest(manifest) {
+      const guests = Array.isArray(manifest.guests) ? manifest.guests : [];
+
+      guestsByToken = new Map();
+
+      guests.forEach(guest => {
+        const token = String(guest.token || '').trim();
+
+        if (!token) {
+          return;
+        }
+
+        guestsByToken.set(token, guest);
+
+        if (guest.checked_in) {
+          localCheckedTokens.add(token);
+        }
+      });
+
+      saveLocalState();
+    }
+
+    async function loadManifest({ silent = false } = {}) {
+      if (!secret) {
+        return false;
+      }
+
+      if (!silent) {
+        setStatus('Загружаем список гостей...', '');
+      }
+
+      const url = manifestUrl + '?key=' + encodeURIComponent(secret);
+
+      try {
+        const text = await fetchWithTimeout(url, 8000);
+        const manifest = JSON.parse(text);
+
+        if (!manifest.ok) {
+          throw new Error(manifest.error || 'manifest_not_ok');
+        }
+
+        applyManifest(manifest);
+        saveManifest(manifest);
+
+        if (!silent) {
+          setStatus(
+            '✅ Список гостей загружен. Гостей в списке: ' + guestsByToken.size + '.',
+            'success'
+          );
+        }
+
+        return true;
+      } catch (e) {
+        const cached = readCachedManifest();
+
+        if (cached && cached.ok) {
+          applyManifest(cached);
+
+          if (!silent) {
             setStatus(
-              `Запрос занял больше обычного. Повторяем попытку ${attempt}/${attempts}...`,
-              ''
+              '⚠️ Не удалось обновить список гостей, используем сохранённую копию. Гостей в списке: ' + guestsByToken.size + '.<br><br>' +
+              '<span class="small">Ошибка: ' + escapeHtml(String(e)) + '</span>',
+              'warning'
             );
-            showToast(`Повторяем проверку ${attempt}/${attempts}...`, 'info', 1600);
           }
 
-          return await fetchWithTimeout(url, timeoutMs);
+          return true;
+        }
+
+        setStatus(
+          '❌ Не удалось загрузить список гостей.<br><br>' +
+          'Проверьте интернет и обновите страницу.<br><br>' +
+          '<span class="small">' + escapeHtml(String(e)) + '</span>',
+          'error'
+        );
+
+        return false;
+      }
+    }
+
+    function getGuestDisplay(guest) {
+      const fullName = [guest.name, guest.lastname].filter(Boolean).join(' ') || 'Гость';
+      const company = guest.company || '—';
+      const eventName = guest.event_name || 'мероприятие';
+
+      return {
+        fullName,
+        company,
+        eventName,
+      };
+    }
+
+    function enqueueCheckin(token) {
+      if (!pendingQueue.includes(token)) {
+        pendingQueue.push(token);
+      }
+
+      saveLocalState();
+      syncPendingQueue();
+    }
+
+    async function syncToken(token) {
+      const url =
+        confirmUrl +
+        '?key=' + encodeURIComponent(secret) +
+        '&token=' + encodeURIComponent(token);
+
+      await fetchWithTimeout(url, 5000);
+    }
+
+    async function syncPendingQueue() {
+      if (syncInProgress || !secret || !pendingQueue.length) {
+        setSyncStatus();
+        return;
+      }
+
+      syncInProgress = true;
+      setSyncStatus();
+
+      const remaining = [];
+
+      for (const token of pendingQueue) {
+        try {
+          await syncToken(token);
         } catch (e) {
-          lastError = e;
-
-          if (attempt < attempts) {
-            await sleep(700);
-          }
+          remaining.push(token);
         }
       }
 
-      throw lastError;
+      pendingQueue = remaining;
+      syncInProgress = false;
+      saveLocalState();
+    }
+
+    function showGuestSuccess(guest) {
+      const display = getGuestDisplay(guest);
+
+      showToast('✅ Гость отмечен', 'success', 2500);
+
+      setStatus(
+        '<h3>✅ Гость отмечен</h3>' +
+        '<p><b>' + escapeHtml(display.fullName) + '</b></p>' +
+        '<p>Компания: ' + escapeHtml(display.company) + '</p>' +
+        '<p>Мероприятие: ' + escapeHtml(display.eventName) + '</p>' +
+        '<p class="small">Можно сканировать следующего гостя. Запись в таблицу отправляется в фоне.</p>',
+        'success'
+      );
+    }
+
+    function showAlreadyCheckedIn(guest) {
+      const display = getGuestDisplay(guest);
+
+      showToast('⚠️ Гость уже отмечен', 'warning', 2500);
+
+      setStatus(
+        '<h3>⚠️ Гость уже отмечен</h3>' +
+        '<p><b>' + escapeHtml(display.fullName) + '</b></p>' +
+        '<p>Компания: ' + escapeHtml(display.company) + '</p>' +
+        '<p>Мероприятие: ' + escapeHtml(display.eventName) + '</p>' +
+        '<p>Время отметки: ' + escapeHtml(guest.checked_in_at || '—') + '</p>',
+        'warning'
+      );
+    }
+
+    function showGuestNotFound(token) {
+      showToast('❌ QR не найден', 'error', 3000);
+
+      setStatus(
+        '<h3>❌ QR-код не найден</h3>' +
+        '<p>Гостя нет в локальном списке подтверждённых регистраций.</p>' +
+        '<p class="small">Попробуйте обновить список гостей и отсканировать QR ещё раз.</p>' +
+        '<p class="small">Token: ' + escapeHtml(token) + '</p>',
+        'error'
+      );
     }
 
     async function processToken(rawText) {
@@ -407,43 +593,46 @@
       lastToken = token;
       lastScanAt = now;
 
-      showToast('QR считан<br>Проверяем гостя...', 'info', 2000);
-      setStatus('QR считан. Проверяем гостя...', '');
+      const guest = guestsByToken.get(token);
 
-      try {
-        const url =
-          confirmUrl +
-          '?key=' + encodeURIComponent(secret) +
-          '&token=' + encodeURIComponent(token);
+      if (!guest) {
+        showGuestNotFound(token);
 
-        const html = await fetchWithRetry(url, 3, 6000);
-        const resultType = detectResultType(html);
+        setTimeout(function () {
+          busy = false;
+        }, 1200);
 
-        showToast(shortResultTitle(resultType), resultType, 3500);
+        return;
+      }
 
-        setStatus(
-          html +
-          '<p class="small" style="margin-top:12px;">Можно сканировать следующего гостя.</p>',
-          resultType
-        );
+      const alreadyCheckedIn =
+        guest.checked_in ||
+        localCheckedTokens.has(token);
 
-        if (navigator.vibrate) {
-          navigator.vibrate([120, 80, 120]);
-        }
-      } catch (e) {
-        showToast('❌ Ошибка check-in', 'error', 4500);
+      if (alreadyCheckedIn) {
+        showAlreadyCheckedIn(guest);
 
-        setStatus(
-          '❌ Ошибка check-in. Попробуйте ещё раз.<br><br>' +
-          String(e) +
-          '<br><br><span class="small">Если гость появился в таблице, значит n8n отработал, но браузер не смог прочитать ответ. Проверьте CORS headers в n8n Respond to Webhook.</span>',
-          'error'
-        );
+        setTimeout(function () {
+          busy = false;
+        }, 1200);
+
+        return;
+      }
+
+      guest.checked_in = true;
+      guest.checked_in_at = 'только что';
+      localCheckedTokens.add(token);
+
+      showGuestSuccess(guest);
+      enqueueCheckin(token);
+
+      if (navigator.vibrate) {
+        navigator.vibrate([120, 80, 120]);
       }
 
       setTimeout(function () {
         busy = false;
-      }, 2500);
+      }, 1200);
     }
 
     function scanFrame() {
@@ -514,6 +703,14 @@
       if (!secret) {
         setStatus('⛔ Нет ключа доступа к сканеру.', 'error');
         return;
+      }
+
+      if (!guestsByToken.size) {
+        const loaded = await loadManifest();
+
+        if (!loaded) {
+          return;
+        }
       }
 
       if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
@@ -602,12 +799,25 @@
     document.getElementById('startButton').addEventListener('click', startScanner);
     document.getElementById('stopButton').addEventListener('click', stopScanner);
 
+    document.getElementById('refreshButton').addEventListener('click', function () {
+      loadManifest();
+    });
+
     document.getElementById('manualButton').addEventListener('click', function () {
       const value = document.getElementById('manualToken').value;
       processToken(value);
     });
 
     initAccess();
+    loadLocalState();
+
+    if (secret) {
+      loadManifest({ silent: false });
+      setInterval(syncPendingQueue, 5000);
+      setInterval(function () {
+        loadManifest({ silent: true });
+      }, 60000);
+    }
   </script>
 </body>
 </html>
