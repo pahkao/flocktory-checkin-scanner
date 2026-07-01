@@ -193,10 +193,68 @@
       text-align: center;
     }
 
-    #syncStatus {
+    .sync-card {
       margin-top: 10px;
-      color: var(--muted);
+      padding: 14px;
+      border-radius: 10px;
+      border: 1px solid var(--border);
+      font-size: 16px;
+      line-height: 1.4;
+    }
+
+    .sync-card.success {
+      background: #e8f7ed;
+      border-color: #b7e3c3;
+      color: #075c25;
+    }
+
+    .sync-card.warning {
+      background: #fff6df;
+      border-color: #efd28b;
+      color: #765000;
+    }
+
+    .sync-card.info {
+      background: #eef3f8;
+      border-color: #cfd9e3;
+      color: #24384c;
+    }
+
+    .sync-card.error {
+      background: #fdecec;
+      border-color: #efb6b6;
+      color: #821515;
+    }
+
+    .sync-title {
+      font-size: 18px;
+      font-weight: 700;
+    }
+
+    .sync-details {
+      margin-top: 6px;
       font-size: 13px;
+      font-weight: 400;
+      color: var(--muted);
+    }
+
+    .sync-actions {
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 8px;
+      margin-top: 8px;
+    }
+
+    .sync-actions button {
+      margin: 0;
+      padding: 12px 8px;
+      font-size: 14px;
+    }
+
+    @media (max-width: 420px) {
+      .sync-actions {
+        grid-template-columns: 1fr;
+      }
     }
   </style>
 </head>
@@ -217,7 +275,28 @@
     <button id="refreshButton" class="secondary">Обновить список гостей</button>
 
     <div id="statusPanel">Загружаем список гостей...</div>
-    <div id="syncStatus">Синхронизация: —</div>
+
+    <div id="syncStatus" class="sync-card info">
+      Проверяем очередь синхронизации...
+    </div>
+
+    <div class="sync-actions">
+      <button
+        id="retrySyncButton"
+        class="secondary"
+        type="button"
+      >
+        🔄 Повторить синхронизацию
+      </button>
+
+      <button
+        id="copyPendingButton"
+        class="secondary"
+        type="button"
+      >
+        📋 Скопировать неотправленные QR
+      </button>
+    </div>
 
     <video id="video" playsinline muted autoplay></video>
     <canvas id="canvas"></canvas>
@@ -235,7 +314,7 @@
     </div>
 
     <div class="version">
-      scanner v7-local-manifest
+      scanner v8-safe-sync
     </div>
   </div>
 
@@ -289,13 +368,58 @@
     }
 
     function setSyncStatus() {
-      const syncedLocal = localCheckedTokens.size;
-      const pending = pendingQueue.length;
+      const status = document.getElementById('syncStatus');
+      const retryButton = document.getElementById('retrySyncButton');
+      const copyButton = document.getElementById('copyPendingButton');
 
-      document.getElementById('syncStatus').innerHTML =
-        'Синхронизация: локально отмечено — ' + syncedLocal +
-        ', в очереди на отправку — ' + pending +
-        ', гостей в списке — ' + guestsByToken.size;
+      const pending = pendingQueue.length;
+      const totalGuests = guestsByToken.size;
+
+      const checkedInTable = Array.from(guestsByToken.values())
+        .filter(guest => Boolean(guest.checked_in))
+        .length;
+
+      const checkedInOnThisDevice = Array.from(localCheckedTokens)
+        .filter(token => guestsByToken.has(token))
+        .length;
+
+      const details =
+        '<div class="sync-details">' +
+          'Гостей в списке: ' + totalGuests +
+          ' · Отмечено в таблице по последней загрузке: ' + checkedInTable +
+          ' · Локально отмечено: ' + checkedInOnThisDevice +
+        '</div>';
+
+      if (syncInProgress) {
+        status.className = 'sync-card info';
+        status.innerHTML =
+          '<div class="sync-title">🔄 Синхронизируем отметки...</div>' +
+          '<div>В очереди: ' + pending + '</div>' +
+          details;
+      } else if (pending > 0) {
+        status.className = 'sync-card warning';
+        status.innerHTML =
+          '<div class="sync-title">⚠️ Не закрывайте страницу</div>' +
+          '<div>Не отправлено отметок: <b>' + pending + '</b></div>' +
+          '<div class="sync-details">' +
+            'Нажмите «Повторить синхронизацию». Если отправка не проходит — скопируйте QR для ручного восстановления.' +
+          '</div>' +
+          details;
+      } else {
+        status.className = 'sync-card success';
+        status.innerHTML =
+          '<div class="sync-title">✅ Все отметки синхронизированы</div>' +
+          '<div>Очередь на отправку пуста.</div>' +
+          details;
+      }
+
+      if (retryButton) {
+        retryButton.disabled = syncInProgress || pending === 0;
+      }
+
+      if (copyButton) {
+        copyButton.disabled = pending === 0;
+      }
     }
 
     function escapeHtml(value) {
@@ -348,13 +472,21 @@
       const timer = setTimeout(() => controller.abort(), timeoutMs);
 
       try {
-        const res = await fetch(url, {
+        const response = await fetch(url, {
           method: 'GET',
           cache: 'no-store',
           signal: controller.signal
         });
 
-        return await res.text();
+        const text = await response.text();
+
+        if (!response.ok) {
+          throw new Error(
+            'HTTP ' + response.status + ': ' + text.slice(0, 300)
+          );
+        }
+
+        return text;
       } finally {
         clearTimeout(timer);
       }
@@ -504,28 +636,210 @@
       await fetchWithTimeout(url, 5000);
     }
 
-    async function syncPendingQueue() {
-      if (syncInProgress || !secret || !pendingQueue.length) {
+    async function syncPendingQueue({ manual = false } = {}) {
+      if (syncInProgress) {
+        if (manual) {
+          showToast(
+            '🔄 Синхронизация уже выполняется',
+            'info',
+            2200
+          );
+        }
+
+        return;
+      }
+
+      if (!secret) {
+        if (manual) {
+          showToast(
+            '❌ Нет ключа доступа к сканеру',
+            'error',
+            3000
+          );
+        }
+
+        return;
+      }
+
+      if (!pendingQueue.length) {
         setSyncStatus();
+
+        if (manual) {
+          showToast(
+            '✅ Очередь уже пуста',
+            'success',
+            2200
+          );
+        }
+
         return;
       }
 
       syncInProgress = true;
       setSyncStatus();
 
-      const remaining = [];
+      /*
+       * Работаем со снимком текущей очереди.
+       * Новые QR, отсканированные во время синхронизации,
+       * не должны потеряться.
+       */
+      const queueSnapshot = Array.from(new Set(pendingQueue));
+      const snapshotTokens = new Set(queueSnapshot);
+      const failedTokens = [];
 
-      for (const token of pendingQueue) {
+      for (const token of queueSnapshot) {
         try {
           await syncToken(token);
-        } catch (e) {
-          remaining.push(token);
+        } catch (error) {
+          console.error(
+            'Не удалось синхронизировать token:',
+            token,
+            error
+          );
+
+          failedTokens.push(token);
         }
       }
 
-      pendingQueue = remaining;
+      /*
+       * Пока шла отправка, хостес могла отсканировать
+       * новых гостей. Сохраняем эти новые token вместе
+       * с теми, которые не удалось отправить.
+       */
+      const addedDuringSync = pendingQueue.filter(token => {
+        return !snapshotTokens.has(token);
+      });
+
+      pendingQueue = Array.from(
+        new Set([
+          ...failedTokens,
+          ...addedDuringSync
+        ])
+      );
+
       syncInProgress = false;
       saveLocalState();
+
+      if (manual) {
+        if (pendingQueue.length === 0) {
+          showToast(
+            '✅ Все отметки отправлены',
+            'success',
+            2800
+          );
+        } else {
+          showToast(
+            '⚠️ Не отправлено: ' + pendingQueue.length,
+            'warning',
+            3200
+          );
+        }
+      }
+    }
+
+    function buildPendingExport() {
+      const uniqueTokens = Array.from(new Set(pendingQueue));
+
+      const lines = uniqueTokens.map((token, index) => {
+        const guest = guestsByToken.get(token);
+
+        const fullName = guest
+          ? [guest.name, guest.lastname]
+              .filter(Boolean)
+              .join(' ')
+          : '';
+
+        const company = guest?.company || '';
+
+        return [
+          index + 1,
+          token,
+          fullName,
+          company
+        ]
+          .filter(value => String(value).trim())
+          .join('\t');
+      });
+
+      return [
+        'Flocktory Check-in — неотправленные QR',
+        'Дата выгрузки: ' + new Date().toLocaleString('ru-RU'),
+        'Количество: ' + uniqueTokens.length,
+        '',
+        '№\tToken\tГость\tКомпания',
+        ...lines
+      ].join('\n');
+    }
+
+    function fallbackCopyText(text) {
+      const textarea = document.createElement('textarea');
+
+      textarea.value = text;
+      textarea.setAttribute('readonly', '');
+      textarea.style.position = 'fixed';
+      textarea.style.left = '-9999px';
+
+      document.body.appendChild(textarea);
+      textarea.select();
+
+      const copied = document.execCommand('copy');
+
+      document.body.removeChild(textarea);
+
+      if (!copied) {
+        throw new Error('Не удалось скопировать текст');
+      }
+    }
+
+    async function copyPendingTokens() {
+      if (!pendingQueue.length) {
+        showToast(
+          '✅ Неотправленных QR нет',
+          'success',
+          2200
+        );
+
+        return;
+      }
+
+      const text = buildPendingExport();
+
+      try {
+        if (
+          navigator.clipboard &&
+          typeof navigator.clipboard.writeText === 'function'
+        ) {
+          await navigator.clipboard.writeText(text);
+        } else {
+          fallbackCopyText(text);
+        }
+
+        showToast(
+          '📋 Скопировано QR: ' + pendingQueue.length,
+          'success',
+          3000
+        );
+      } catch (error) {
+        console.error(error);
+
+        try {
+          fallbackCopyText(text);
+
+          showToast(
+            '📋 Скопировано QR: ' + pendingQueue.length,
+            'success',
+            3000
+          );
+        } catch (fallbackError) {
+          console.error(fallbackError);
+
+          showToast(
+            '❌ Не удалось скопировать список',
+            'error',
+            3200
+          );
+        }
+      }
     }
 
     function showGuestSuccess(guest) {
@@ -808,12 +1122,37 @@
       processToken(value);
     });
 
+    document
+      .getElementById('retrySyncButton')
+      .addEventListener('click', function () {
+        syncPendingQueue({ manual: true });
+      });
+
+    document
+      .getElementById('copyPendingButton')
+      .addEventListener('click', copyPendingTokens);
+
+    window.addEventListener('beforeunload', function (event) {
+      if (!pendingQueue.length) {
+        return;
+      }
+
+      event.preventDefault();
+      event.returnValue = '';
+    });
+
     initAccess();
     loadLocalState();
 
     if (secret) {
       loadManifest({ silent: false });
-      setInterval(syncPendingQueue, 5000);
+
+      setInterval(function () {
+        syncPendingQueue().catch(function (error) {
+          console.error('Ошибка фоновой синхронизации:', error);
+        });
+      }, 5000);
+
       setInterval(function () {
         loadManifest({ silent: true });
       }, 60000);
