@@ -251,6 +251,23 @@
       font-size: 14px;
     }
 
+
+    .scan-hint {
+      display: none;
+      margin-top: 10px;
+      padding: 10px 12px;
+      border-radius: 10px;
+      background: #fff6df;
+      border: 1px solid #efd28b;
+      color: #765000;
+      font-size: 14px;
+      line-height: 1.4;
+    }
+
+    .scan-hint.visible {
+      display: block;
+    }
+
     @media (max-width: 420px) {
       .sync-actions {
         grid-template-columns: 1fr;
@@ -299,6 +316,11 @@
     </div>
 
     <video id="video" playsinline muted autoplay></video>
+
+    <div id="scanHint" class="scan-hint">
+      QR пока не распознан. Держите телефоны параллельно, отодвиньте камеру на 20–30 см и уберите блики с экрана.
+    </div>
+
     <canvas id="canvas"></canvas>
 
     <div class="manual">
@@ -314,7 +336,7 @@
     </div>
 
     <div class="version">
-      scanner v8-safe-sync
+      scanner v9-resilient-qr
     </div>
   </div>
 
@@ -329,6 +351,28 @@
     const canvas = document.getElementById('canvas');
     const ctx = canvas.getContext('2d', { willReadFrequently: true });
 
+    /*
+     * Основной путь остаётся быстрым:
+     * полный кадр проверяется тем же jsQR + dontInvert.
+     *
+     * Более тяжёлые проверки включаются только после того,
+     * как обычный путь некоторое время не смог прочитать QR.
+     */
+    const FAST_DECODE_MAX_WIDTH = 1280;
+    const FAST_DECODE_MAX_HEIGHT = 720;
+    const FALLBACK_START_DELAY_MS = 700;
+    const CENTER_FALLBACK_INTERVAL_MS = 350;
+    const FULL_FALLBACK_INTERVAL_MS = 1200;
+    const SCAN_HINT_DELAY_MS = 1600;
+    const CENTER_CROP_RATIO = 0.92;
+    const CENTER_DECODE_SIZE = 960;
+
+    const fallbackCanvas = document.createElement('canvas');
+    const fallbackCtx = fallbackCanvas.getContext(
+      '2d',
+      { willReadFrequently: true }
+    );
+
     const storagePrefix = 'flocktory_checkin_v7_';
     const manifestStorageKey = storagePrefix + 'manifest';
     const pendingStorageKey = storagePrefix + 'pending';
@@ -341,6 +385,9 @@
     let lastScanAt = 0;
     let rafId = null;
     let toastTimer = null;
+    let scanStartedAt = 0;
+    let lastCenterFallbackAt = 0;
+    let lastFullFallbackAt = 0;
 
     let guestsByToken = new Map();
     let localCheckedTokens = new Set();
@@ -913,7 +960,7 @@
         showGuestNotFound(token);
 
         setTimeout(function () {
-          busy = false;
+          releaseScannerBusy();
         }, 1200);
 
         return;
@@ -927,7 +974,7 @@
         showAlreadyCheckedIn(guest);
 
         setTimeout(function () {
-          busy = false;
+          releaseScannerBusy();
         }, 1200);
 
         return;
@@ -945,43 +992,327 @@
       }
 
       setTimeout(function () {
-        busy = false;
+        releaseScannerBusy();
       }, 1200);
     }
 
-    function scanFrame() {
+    function setScanHintVisible(visible) {
+      const hint = document.getElementById('scanHint');
+
+      if (!hint) {
+        return;
+      }
+
+      hint.classList.toggle('visible', Boolean(visible));
+    }
+
+    function ensureCanvasSize(targetCanvas, width, height) {
+      if (
+        targetCanvas.width !== width ||
+        targetCanvas.height !== height
+      ) {
+        targetCanvas.width = width;
+        targetCanvas.height = height;
+      }
+    }
+
+    function fitInside(width, height, maxWidth, maxHeight) {
+      const scale = Math.min(
+        1,
+        maxWidth / width,
+        maxHeight / height
+      );
+
+      return {
+        width: Math.max(1, Math.round(width * scale)),
+        height: Math.max(1, Math.round(height * scale))
+      };
+    }
+
+    function captureFastFrame() {
+      const sourceWidth = video.videoWidth;
+      const sourceHeight = video.videoHeight;
+
+      if (!sourceWidth || !sourceHeight) {
+        return null;
+      }
+
+      /*
+       * Даже если камера отдаёт Full HD, основной декодер
+       * работает максимум с 1280×720. Это сохраняет скорость
+       * текущей версии и не заставляет jsQR разбирать 2 млн пикселей.
+       */
+      const target = fitInside(
+        sourceWidth,
+        sourceHeight,
+        FAST_DECODE_MAX_WIDTH,
+        FAST_DECODE_MAX_HEIGHT
+      );
+
+      ensureCanvasSize(
+        canvas,
+        target.width,
+        target.height
+      );
+
+      ctx.drawImage(
+        video,
+        0,
+        0,
+        sourceWidth,
+        sourceHeight,
+        0,
+        0,
+        target.width,
+        target.height
+      );
+
+      return ctx.getImageData(
+        0,
+        0,
+        target.width,
+        target.height
+      );
+    }
+
+    function decodeFastFrame(imageData) {
+      if (!imageData) {
+        return null;
+      }
+
+      /*
+       * Быстрый основной путь — такой же режим,
+       * который уже хорошо работал на большинстве QR.
+       */
+      return jsQR(
+        imageData.data,
+        imageData.width,
+        imageData.height,
+        {
+          inversionAttempts: 'dontInvert'
+        }
+      );
+    }
+
+    function decodeFullFallback(imageData) {
+      if (!imageData) {
+        return null;
+      }
+
+      /*
+       * Более тяжёлая проверка прямого и инвертированного QR.
+       * Запускается редко и только если быстрый путь не справился.
+       */
+      return jsQR(
+        imageData.data,
+        imageData.width,
+        imageData.height,
+        {
+          inversionAttempts: 'attemptBoth'
+        }
+      );
+    }
+
+    function decodeCenterFallback() {
+      const sourceWidth = video.videoWidth;
+      const sourceHeight = video.videoHeight;
+
+      if (!sourceWidth || !sourceHeight) {
+        return null;
+      }
+
+      /*
+       * QR обычно находится около центра кадра.
+       * Квадратный crop уменьшает фон, блики и лишние детали,
+       * а затем декодируется в достаточно высоком разрешении.
+       */
+      const cropSize = Math.max(
+        1,
+        Math.floor(
+          Math.min(sourceWidth, sourceHeight) *
+          CENTER_CROP_RATIO
+        )
+      );
+
+      const sourceX = Math.max(
+        0,
+        Math.floor((sourceWidth - cropSize) / 2)
+      );
+
+      const sourceY = Math.max(
+        0,
+        Math.floor((sourceHeight - cropSize) / 2)
+      );
+
+      ensureCanvasSize(
+        fallbackCanvas,
+        CENTER_DECODE_SIZE,
+        CENTER_DECODE_SIZE
+      );
+
+      fallbackCtx.drawImage(
+        video,
+        sourceX,
+        sourceY,
+        cropSize,
+        cropSize,
+        0,
+        0,
+        CENTER_DECODE_SIZE,
+        CENTER_DECODE_SIZE
+      );
+
+      const imageData = fallbackCtx.getImageData(
+        0,
+        0,
+        CENTER_DECODE_SIZE,
+        CENTER_DECODE_SIZE
+      );
+
+      return jsQR(
+        imageData.data,
+        imageData.width,
+        imageData.height,
+        {
+          inversionAttempts: 'attemptBoth'
+        }
+      );
+    }
+
+    function handleDecodedCode(code) {
+      if (!code || !code.data) {
+        return false;
+      }
+
+      setScanHintVisible(false);
+      processToken(code.data);
+
+      return true;
+    }
+
+    function releaseScannerBusy() {
+      busy = false;
+      scanStartedAt = performance.now();
+      lastCenterFallbackAt = 0;
+      lastFullFallbackAt = 0;
+      setScanHintVisible(false);
+    }
+
+    function scanFrame(timestamp = performance.now()) {
       if (!scanning) {
         return;
       }
 
-      if (video.readyState === video.HAVE_ENOUGH_DATA) {
-        const width = video.videoWidth;
-        const height = video.videoHeight;
+      if (
+        !busy &&
+        video.readyState === video.HAVE_ENOUGH_DATA
+      ) {
+        const imageData = captureFastFrame();
+        const fastCode = decodeFastFrame(imageData);
 
-        if (width && height) {
-          canvas.width = width;
-          canvas.height = height;
+        if (!handleDecodedCode(fastCode)) {
+          const scanningFor =
+            timestamp - scanStartedAt;
 
-          ctx.drawImage(video, 0, 0, width, height);
+          /*
+           * Не трогаем быстрый путь первые 700 мс.
+           * Если QR сложный, включаем дополнительные попытки.
+           */
+          if (
+            scanningFor >= FALLBACK_START_DELAY_MS &&
+            timestamp - lastCenterFallbackAt >=
+              CENTER_FALLBACK_INTERVAL_MS
+          ) {
+            lastCenterFallbackAt = timestamp;
 
-          const imageData = ctx.getImageData(0, 0, width, height);
+            const centerCode =
+              decodeCenterFallback();
 
-          const code = jsQR(
-            imageData.data,
-            imageData.width,
-            imageData.height,
-            {
-              inversionAttempts: 'dontInvert'
+            if (handleDecodedCode(centerCode)) {
+              rafId = requestAnimationFrame(
+                scanFrame
+              );
+              return;
             }
-          );
-
-          if (code && code.data) {
-            processToken(code.data);
           }
+
+          /*
+           * Полный кадр с attemptBoth — самая тяжёлая проверка.
+           * Запускается не чаще одного раза в 1,2 секунды.
+           */
+          if (
+            scanningFor >= FALLBACK_START_DELAY_MS &&
+            timestamp - lastFullFallbackAt >=
+              FULL_FALLBACK_INTERVAL_MS
+          ) {
+            lastFullFallbackAt = timestamp;
+
+            const fullFallbackCode =
+              decodeFullFallback(imageData);
+
+            handleDecodedCode(
+              fullFallbackCode
+            );
+          }
+
+          setScanHintVisible(
+            scanningFor >= SCAN_HINT_DELAY_MS
+          );
         }
       }
 
       rafId = requestAnimationFrame(scanFrame);
+    }
+
+    async function optimizeCameraTrack(track) {
+      if (
+        !track ||
+        typeof track.getCapabilities !== 'function' ||
+        typeof track.applyConstraints !== 'function'
+      ) {
+        return;
+      }
+
+      try {
+        const capabilities =
+          track.getCapabilities();
+
+        const advanced = [];
+
+        if (
+          Array.isArray(capabilities.focusMode) &&
+          capabilities.focusMode.includes('continuous')
+        ) {
+          advanced.push({
+            focusMode: 'continuous'
+          });
+        }
+
+        if (
+          Array.isArray(capabilities.exposureMode) &&
+          capabilities.exposureMode.includes('continuous')
+        ) {
+          advanced.push({
+            exposureMode: 'continuous'
+          });
+        }
+
+        if (advanced.length) {
+          await track.applyConstraints({
+            advanced
+          });
+        }
+      } catch (error) {
+        /*
+         * Оптимизация необязательна.
+         * Если браузер её не поддерживает,
+         * камера продолжает работать как раньше.
+         */
+        console.info(
+          'Дополнительные настройки камеры недоступны:',
+          error
+        );
+      }
     }
 
     async function getCameraStream() {
@@ -990,8 +1321,8 @@
           audio: false,
           video: {
             facingMode: { ideal: 'environment' },
-            width: { ideal: 1280 },
-            height: { ideal: 720 }
+            width: { ideal: 1920 },
+            height: { ideal: 1080 }
           }
         });
       } catch (firstError) {
@@ -1053,17 +1384,32 @@
       try {
         stream = await getCameraStream();
 
+        const videoTrack =
+          stream.getVideoTracks()[0];
+
+        await optimizeCameraTrack(
+          videoTrack
+        );
+
         video.srcObject = stream;
         video.style.display = 'block';
 
         await video.play();
 
         scanning = true;
+        scanStartedAt = performance.now();
+        lastCenterFallbackAt = 0;
+        lastFullFallbackAt = 0;
+        setScanHintVisible(false);
 
         document.getElementById('startButton').style.display = 'none';
         document.getElementById('stopButton').style.display = 'block';
 
-        setStatus('✅ Сканер запущен. Наведите камеру на QR гостя.', 'success');
+        setStatus(
+          '✅ Сканер запущен. Наведите камеру на QR гостя.<br>' +
+          '<span class="small">Для сложных QR автоматически включится усиленное распознавание.</span>',
+          'success'
+        );
 
         scanFrame();
       } catch (e) {
@@ -1086,6 +1432,7 @@
     async function stopScanner() {
       scanning = false;
       busy = false;
+      setScanHintVisible(false);
 
       if (rafId) {
         cancelAnimationFrame(rafId);
