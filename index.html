@@ -268,6 +268,45 @@
       display: block;
     }
 
+
+    .manual-search-card {
+      margin-top: 10px;
+      padding: 12px;
+      border: 1px solid var(--border);
+      border-radius: 10px;
+      background: #fff;
+    }
+
+    .manual-result {
+      margin-top: 8px;
+      padding: 10px;
+      border: 1px solid var(--border);
+      border-radius: 10px;
+      background: #fff;
+    }
+
+    .manual-result.checked {
+      background: #fff6df;
+      border-color: #efd28b;
+    }
+
+    .manual-result button {
+      margin-top: 8px;
+      padding: 10px;
+      font-size: 15px;
+    }
+
+    .manual-result-title {
+      font-size: 16px;
+      font-weight: 700;
+    }
+
+    .manual-result-meta {
+      margin-top: 4px;
+      color: var(--muted);
+      font-size: 13px;
+    }
+
     @media (max-width: 420px) {
       .sync-actions {
         grid-template-columns: 1fr;
@@ -324,10 +363,21 @@
     <canvas id="canvas"></canvas>
 
     <div class="manual">
-      <details>
+      <details open>
+        <summary>Ручной поиск гостя по списку</summary>
+        <div class="manual-search-card">
+          <input id="manualSearch" placeholder="Фамилия, имя, компания, username, последние цифры телефона">
+          <div class="small" style="margin-top:6px;">
+            Поиск работает по загруженному манифесту. Можно найти гостя и отметить без QR.
+          </div>
+          <div id="manualResults"></div>
+        </div>
+      </details>
+
+      <details style="margin-top:12px;">
         <summary>Ручной ввод token, если камера не работает</summary>
         <input id="manualToken" placeholder="Вставьте token или ссылку из QR">
-        <button id="manualButton" class="secondary">Отметить вручную</button>
+        <button id="manualButton" class="secondary">Отметить по token</button>
       </details>
     </div>
 
@@ -336,16 +386,18 @@
     </div>
 
     <div class="version">
-      scanner v9-resilient-qr
+      scanner v10-resilient-qr-manual-search
     </div>
   </div>
 
   <script>
-    const confirmUrl = 'https://fleventbot.app.n8n.cloud/webhook/checkin-confirm';
-    const manifestUrl = 'https://fleventbot.app.n8n.cloud/webhook/checkin-manifest';
+    const confirmUrl = 'https://fleventbot.app.n8n.cloud/webhook/checkin-confirm-v2';
+    const manifestUrl = 'https://fleventbot.app.n8n.cloud/webhook/checkin-manifest-v2';
 
     const params = new URLSearchParams(window.location.search);
     const secret = params.get('key') || '';
+    const eventId = params.get('event_id') || '';
+    const checkedInBy = params.get('checked_in_by') || params.get('hostess') || '';
 
     const video = document.getElementById('video');
     const canvas = document.getElementById('canvas');
@@ -373,7 +425,7 @@
       { willReadFrequently: true }
     );
 
-    const storagePrefix = 'flocktory_checkin_v7_';
+    const storagePrefix = 'flocktory_checkin_v10_' + (eventId || 'all') + '_';
     const manifestStorageKey = storagePrefix + 'manifest';
     const pendingStorageKey = storagePrefix + 'pending';
     const localCheckedStorageKey = storagePrefix + 'local_checked';
@@ -389,7 +441,9 @@
     let lastCenterFallbackAt = 0;
     let lastFullFallbackAt = 0;
 
+    let guestsList = [];
     let guestsByToken = new Map();
+    let guestsByRegistrationId = new Map();
     let localCheckedTokens = new Set();
     let pendingQueue = [];
     let syncInProgress = false;
@@ -576,23 +630,29 @@
     function applyManifest(manifest) {
       const guests = Array.isArray(manifest.guests) ? manifest.guests : [];
 
+      guestsList = guests;
       guestsByToken = new Map();
+      guestsByRegistrationId = new Map();
 
       guests.forEach(guest => {
         const token = String(guest.token || '').trim();
+        const registrationId = String(guest.registration_id || guest.request_id || '').trim();
 
-        if (!token) {
-          return;
+        if (token) {
+          guestsByToken.set(token, guest);
+
+          if (guest.checked_in) {
+            localCheckedTokens.add(token);
+          }
         }
 
-        guestsByToken.set(token, guest);
-
-        if (guest.checked_in) {
-          localCheckedTokens.add(token);
+        if (registrationId) {
+          guestsByRegistrationId.set(registrationId, guest);
         }
       });
 
       saveLocalState();
+      renderManualSearchResults();
     }
 
     async function loadManifest({ silent = false } = {}) {
@@ -604,7 +664,10 @@
         setStatus('Загружаем список гостей...', '');
       }
 
-      const url = manifestUrl + '?key=' + encodeURIComponent(secret);
+      const url =
+        manifestUrl +
+        '?key=' + encodeURIComponent(secret) +
+        (eventId ? '&event_id=' + encodeURIComponent(eventId) : '');
 
       try {
         const text = await fetchWithTimeout(url, 8000);
@@ -619,7 +682,7 @@
 
         if (!silent) {
           setStatus(
-            '✅ Список гостей загружен. Гостей в списке: ' + guestsByToken.size + '.',
+            '✅ Список гостей загружен. Гостей в списке: ' + guestsList.length + ' · с QR: ' + guestsByToken.size + '.',
             'success'
           );
         }
@@ -633,7 +696,7 @@
 
           if (!silent) {
             setStatus(
-              '⚠️ Не удалось обновить список гостей, используем сохранённую копию. Гостей в списке: ' + guestsByToken.size + '.<br><br>' +
+              '⚠️ Не удалось обновить список гостей, используем сохранённую копию. Гостей в списке: ' + guestsList.length + ' · с QR: ' + guestsByToken.size + '.<br><br>' +
               '<span class="small">Ошибка: ' + escapeHtml(String(e)) + '</span>',
               'warning'
             );
@@ -678,7 +741,10 @@
       const url =
         confirmUrl +
         '?key=' + encodeURIComponent(secret) +
-        '&token=' + encodeURIComponent(token);
+        '&token=' + encodeURIComponent(token) +
+        '&source=' + encodeURIComponent('qr') +
+        (eventId ? '&event_id=' + encodeURIComponent(eventId) : '') +
+        (checkedInBy ? '&checked_in_by=' + encodeURIComponent(checkedInBy) : '');
 
       await fetchWithTimeout(url, 5000);
     }
@@ -886,6 +952,145 @@
             3200
           );
         }
+      }
+    }
+
+
+    function buildGuestSearchText(guest) {
+      return [
+        guest.search_text,
+        guest.full_name,
+        guest.name,
+        guest.lastname,
+        guest.username,
+        guest.company,
+        guest.grade,
+        guest.category,
+        guest.job_title,
+        guest.manager_name,
+        guest.team,
+        guest.department,
+        guest.phone_last4,
+        guest.phone_last6,
+        guest.mail,
+        guest.registration_id,
+        guest.request_id
+      ]
+        .filter(Boolean)
+        .join(' ')
+        .toLowerCase();
+    }
+
+    function renderManualSearchResults() {
+      const input = document.getElementById('manualSearch');
+      const container = document.getElementById('manualResults');
+
+      if (!input || !container) {
+        return;
+      }
+
+      const query = String(input.value || '').trim().toLowerCase();
+
+      if (!query) {
+        container.innerHTML = '<div class="small" style="margin-top:8px;">Введите минимум 2 символа для поиска.</div>';
+        return;
+      }
+
+      if (query.length < 2) {
+        container.innerHTML = '<div class="small" style="margin-top:8px;">Введите ещё символы.</div>';
+        return;
+      }
+
+      const matches = guestsList
+        .filter(guest => buildGuestSearchText(guest).includes(query))
+        .slice(0, 12);
+
+      if (!matches.length) {
+        container.innerHTML =
+          '<div class="manual-result">' +
+            '<div class="manual-result-title">Ничего не найдено</div>' +
+            '<div class="manual-result-meta">Попробуйте фамилию, имя, компанию, @username или последние цифры телефона.</div>' +
+          '</div>';
+        return;
+      }
+
+      container.innerHTML = matches.map(guest => {
+        const registrationId = String(guest.registration_id || guest.request_id || '').trim();
+        const token = String(guest.token || '').trim();
+        const checked = Boolean(guest.checked_in) || (token && localCheckedTokens.has(token));
+        const name = escapeHtml(guest.full_name || [guest.name, guest.lastname].filter(Boolean).join(' ') || 'Гость');
+        const company = escapeHtml(guest.company || '—');
+        const team = escapeHtml(guest.team || guest.department || '');
+        const username = guest.username ? '@' + escapeHtml(String(guest.username).replace(/^@/, '')) : '';
+        const button = checked
+          ? '<button class="secondary" type="button" disabled>Уже отмечен</button>'
+          : '<button class="primary" type="button" onclick="manualCheckin(\'' + escapeHtml(registrationId) + '\')">Отметить вручную</button>';
+
+        return '<div class="manual-result ' + (checked ? 'checked' : '') + '">' +
+          '<div class="manual-result-title">' + name + '</div>' +
+          '<div class="manual-result-meta">' +
+            'Компания: ' + company +
+            (team ? '<br>Команда/отдел: ' + team : '') +
+            (username ? '<br>Telegram: ' + username : '') +
+            '<br>ID: ' + escapeHtml(registrationId || '—') +
+          '</div>' +
+          button +
+        '</div>';
+      }).join('');
+    }
+
+    async function manualCheckin(registrationId) {
+      const id = String(registrationId || '').trim();
+      const guest = guestsByRegistrationId.get(id);
+
+      if (!id || !guest) {
+        showToast('❌ Гость не найден в манифесте', 'error', 3000);
+        return;
+      }
+
+      if (guest.checked_in) {
+        showAlreadyCheckedIn(guest);
+        renderManualSearchResults();
+        return;
+      }
+
+      showToast('Проверяем гостя...', 'info', 1500);
+
+      try {
+        const url =
+          confirmUrl +
+          '?key=' + encodeURIComponent(secret) +
+          '&registration_id=' + encodeURIComponent(id) +
+          '&source=' + encodeURIComponent('manual') +
+          (eventId ? '&event_id=' + encodeURIComponent(eventId) : '') +
+          (checkedInBy ? '&checked_in_by=' + encodeURIComponent(checkedInBy) : '');
+
+        const html = await fetchWithTimeout(url, 8000);
+
+        guest.checked_in = true;
+        guest.checked_in_at = 'только что';
+
+        const token = String(guest.token || '').trim();
+        if (token) {
+          localCheckedTokens.add(token);
+        }
+
+        saveLocalState();
+        renderManualSearchResults();
+
+        showToast('✅ Гость отмечен вручную', 'success', 2500);
+        setStatus(
+          html + '<p class="small">Ручная отметка отправлена в таблицу.</p>',
+          'success'
+        );
+      } catch (error) {
+        showToast('❌ Не удалось отметить вручную', 'error', 3200);
+        setStatus(
+          '<h3>❌ Ошибка ручного check-in</h3>' +
+          '<p>Попробуйте ещё раз или отметьте гостя в бумажном списке.</p>' +
+          '<p class="small">' + escapeHtml(String(error)) + '</p>',
+          'error'
+        );
       }
     }
 
@@ -1467,6 +1672,10 @@
     document.getElementById('manualButton').addEventListener('click', function () {
       const value = document.getElementById('manualToken').value;
       processToken(value);
+    });
+
+    document.getElementById('manualSearch').addEventListener('input', function () {
+      renderManualSearchResults();
     });
 
     document
