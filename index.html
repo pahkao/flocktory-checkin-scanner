@@ -3,7 +3,7 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>Flocktory Check-in</title>
+  <title>Flocktory Internal Check-in</title>
 
   <script src="https://cdn.jsdelivr.net/npm/jsqr@1.4.0/dist/jsQR.min.js"></script>
 
@@ -318,7 +318,7 @@
 <body>
   <div id="toast" class="toast hidden"></div>
 
-  <h1>Flocktory Check-in</h1>
+  <h1>Flocktory Internal Check-in</h1>
   <p>Нажмите кнопку и наведите камеру на QR гостя.</p>
 
   <div id="accessError" class="access-error" style="display:none;">
@@ -366,7 +366,7 @@
       <details open>
         <summary>Ручной поиск гостя по списку</summary>
         <div class="manual-search-card">
-          <input id="manualSearch" placeholder="Фамилия, имя, компания, username, последние цифры телефона">
+          <input id="manualSearch" placeholder="Фамилия, имя, грейд, трансфер, username, последние цифры телефона">
           <div class="small" style="margin-top:6px;">
             Поиск работает по загруженному манифесту. Можно найти гостя и отметить без QR.
           </div>
@@ -386,13 +386,13 @@
     </div>
 
     <div class="version">
-      scanner v10-resilient-qr-manual-search
+      scanner internal-events-v1-github-pages
     </div>
   </div>
 
   <script>
-    const confirmUrl = 'https://fleventbot.app.n8n.cloud/webhook/checkin-confirm-v2';
-    const manifestUrl = 'https://fleventbot.app.n8n.cloud/webhook/checkin-manifest-v2';
+    const confirmUrl = 'https://fleventbot.app.n8n.cloud/webhook/internal-events-checkin-confirm';
+    const manifestUrl = 'https://fleventbot.app.n8n.cloud/webhook/internal-events-checkin-manifest';
 
     const params = new URLSearchParams(window.location.search);
     const secret = params.get('key') || '';
@@ -425,7 +425,7 @@
       { willReadFrequently: true }
     );
 
-    const storagePrefix = 'flocktory_checkin_v10_' + (eventId || 'all') + '_';
+    const storagePrefix = 'flocktory_internal_checkin_v1_' + (eventId || 'all') + '_';
     const manifestStorageKey = storagePrefix + 'manifest';
     const pendingStorageKey = storagePrefix + 'pending';
     const localCheckedStorageKey = storagePrefix + 'local_checked';
@@ -718,12 +718,14 @@
 
     function getGuestDisplay(guest) {
       const fullName = [guest.name, guest.lastname].filter(Boolean).join(' ') || 'Гость';
-      const company = guest.company || '—';
+      const grade = guest.grade || '—';
+      const transfer = guest.transfer || '—';
       const eventName = guest.event_name || 'мероприятие';
 
       return {
         fullName,
-        company,
+        grade,
+        transfer,
         eventName,
       };
     }
@@ -862,24 +864,26 @@
               .join(' ')
           : '';
 
-        const company = guest?.company || '';
+        const grade = guest?.grade || '';
+        const transfer = guest?.transfer || '';
 
         return [
           index + 1,
           token,
           fullName,
-          company
+          grade,
+          transfer
         ]
           .filter(value => String(value).trim())
           .join('\t');
       });
 
       return [
-        'Flocktory Check-in — неотправленные QR',
+        'Flocktory Internal Check-in — неотправленные QR',
         'Дата выгрузки: ' + new Date().toLocaleString('ru-RU'),
         'Количество: ' + uniqueTokens.length,
         '',
-        '№\tToken\tГость\tКомпания',
+        '№\tToken\tГость\tГрейд\tТрансфер',
         ...lines
       ].join('\n');
     }
@@ -963,13 +967,8 @@
         guest.name,
         guest.lastname,
         guest.username,
-        guest.company,
         guest.grade,
-        guest.category,
-        guest.job_title,
-        guest.manager_name,
-        guest.team,
-        guest.department,
+        guest.transfer,
         guest.phone_last4,
         guest.phone_last6,
         guest.mail,
@@ -1009,7 +1008,7 @@
         container.innerHTML =
           '<div class="manual-result">' +
             '<div class="manual-result-title">Ничего не найдено</div>' +
-            '<div class="manual-result-meta">Попробуйте фамилию, имя, компанию, @username или последние цифры телефона.</div>' +
+            '<div class="manual-result-meta">Попробуйте фамилию, имя, грейд, трансфер, @username или последние цифры телефона.</div>' +
           '</div>';
         return;
       }
@@ -1019,8 +1018,8 @@
         const token = String(guest.token || '').trim();
         const checked = Boolean(guest.checked_in) || (token && localCheckedTokens.has(token));
         const name = escapeHtml(guest.full_name || [guest.name, guest.lastname].filter(Boolean).join(' ') || 'Гость');
-        const company = escapeHtml(guest.company || '—');
-        const team = escapeHtml(guest.team || guest.department || '');
+        const grade = escapeHtml(guest.grade || '—');
+        const transfer = escapeHtml(guest.transfer || '—');
         const username = guest.username ? '@' + escapeHtml(String(guest.username).replace(/^@/, '')) : '';
         const button = checked
           ? '<button class="secondary" type="button" disabled>Уже отмечен</button>'
@@ -1029,8 +1028,8 @@
         return '<div class="manual-result ' + (checked ? 'checked' : '') + '">' +
           '<div class="manual-result-title">' + name + '</div>' +
           '<div class="manual-result-meta">' +
-            'Компания: ' + company +
-            (team ? '<br>Команда/отдел: ' + team : '') +
+            'Грейд: ' + grade +
+            '<br>Трансфер: ' + transfer +
             (username ? '<br>Telegram: ' + username : '') +
             '<br>ID: ' + escapeHtml(registrationId || '—') +
           '</div>' +
@@ -1102,7 +1101,8 @@
       setStatus(
         '<h3>✅ Гость отмечен</h3>' +
         '<p><b>' + escapeHtml(display.fullName) + '</b></p>' +
-        '<p>Компания: ' + escapeHtml(display.company) + '</p>' +
+        '<p>Грейд: ' + escapeHtml(display.grade) + '</p>' +
+        '<p>Трансфер: ' + escapeHtml(display.transfer) + '</p>' +
         '<p>Мероприятие: ' + escapeHtml(display.eventName) + '</p>' +
         '<p class="small">Можно сканировать следующего гостя. Запись в таблицу отправляется в фоне.</p>',
         'success'
@@ -1117,7 +1117,8 @@
       setStatus(
         '<h3>⚠️ Гость уже отмечен</h3>' +
         '<p><b>' + escapeHtml(display.fullName) + '</b></p>' +
-        '<p>Компания: ' + escapeHtml(display.company) + '</p>' +
+        '<p>Грейд: ' + escapeHtml(display.grade) + '</p>' +
+        '<p>Трансфер: ' + escapeHtml(display.transfer) + '</p>' +
         '<p>Мероприятие: ' + escapeHtml(display.eventName) + '</p>' +
         '<p>Время отметки: ' + escapeHtml(guest.checked_in_at || '—') + '</p>',
         'warning'
@@ -1711,7 +1712,7 @@
 
       setInterval(function () {
         loadManifest({ silent: true });
-      }, 60000);
+      }, 300000);
     }
   </script>
 </body>
