@@ -1064,7 +1064,7 @@
           (eventId ? '&event_id=' + encodeURIComponent(eventId) : '') +
           (checkedInBy ? '&checked_in_by=' + encodeURIComponent(checkedInBy) : '');
 
-        const html = await fetchWithTimeout(url, 8000);
+        const html = await fetchWithTimeout(url, 30000);
 
         guest.checked_in = true;
         guest.checked_in_at = 'только что';
