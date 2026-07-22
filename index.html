@@ -670,7 +670,7 @@
         (eventId ? '&event_id=' + encodeURIComponent(eventId) : '');
 
       try {
-        const text = await fetchWithTimeout(url, 8000);
+        const text = await fetchWithTimeout(url, 30000);
         const manifest = JSON.parse(text);
 
         if (!manifest.ok) {
